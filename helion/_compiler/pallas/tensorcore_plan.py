@@ -72,7 +72,7 @@ def select_tensorcore_plan(
     positions = [
         index
         for index, pattern in enumerate(access.patterns)
-        if isinstance(pattern, TensorIndexPattern)
+        if isinstance(pattern, TensorIndexPattern) and pattern.index_ndim > 0
     ]
     if not positions:
         return None
