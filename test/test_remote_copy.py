@@ -299,7 +299,7 @@ def _pipeline_remote_copy(
 
 @helion.kernel(
     static_shapes=True,
-    config=helion.Config(block_sizes=[]),
+    config=helion.Config(block_sizes=[], pallas_loop_type="fori_loop"),
 )
 def _indexed_computed_pipeline_copy(
     src: torch.Tensor,
@@ -1298,10 +1298,14 @@ class TestRemoteCopyJaxRuntime(TestCase):
         self.assertIn("remote_send_sem.at[", source)
         self.assertIn("remote_src.at[", source)
         self.assertNotIn("remote_src[...] =", source)
+        self.assertIn("remote_send_pending", source)
+        self.assertIn("def _send_wait_body", source)
+        self.assertIn("_send_drain", source)
         self.assertIn(
             "_scratch_shapes = [((2,), None, 'dma_semaphore'), "
             "((), None, 'dma_semaphore'), "
-            "((2, 1, 128), 'jnp.float32', 'vmem')]",
+            "((2, 1, 128), 'jnp.float32', 'vmem'), "
+            "((128,), 'jnp.int32', 'vmem')]",
             source,
         )
 
