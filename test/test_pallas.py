@@ -645,6 +645,16 @@ def pallas_aligned_dynamic_window(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_aligned_row_window(x: torch.Tensor) -> torch.Tensor:
+    rows = hl.specialize(x.size(0))
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(rows, block_size=8):
+        row_indices = tile_m.begin + hl.arange(8)
+        out[tile_m, :] = x[row_indices, :] + 1
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_bf16_dynamic_window_1d(
     table: torch.Tensor, starts: torch.Tensor
 ) -> torch.Tensor:
@@ -1514,6 +1524,17 @@ class TestPallas(TestCase):
         self.assertIn("jnp.pad", code)
         expected = torch.nn.functional.pad(x, (0, 128), value=0.0)
         torch.testing.assert_close(result, expected)
+
+    def test_aligned_row_window_uses_direct_hbm_dma(self) -> None:
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_aligned_row_window,
+            (x,),
+            block_sizes=[],
+        )
+        self.assertIn("pltpu.make_async_copy(x.at[pl.ds(", code)
+        self.assertNotIn("one_hot", code)
+        torch.testing.assert_close(result, x + 1)
 
     def test_static_index_in_python_helper_uses_basic_slices(self) -> None:
         x = torch.randn(16, 64, device=DEVICE, dtype=torch.float32)
