@@ -523,6 +523,38 @@ def _pipelined_remote_hbm_consume(
 
 
 @helion.kernel(
+    backend="pallas",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[], pallas_loop_type="fori_loop"),
+)
+def _overlap_read_only_input_dma(
+    lhs: torch.Tensor,
+    weight: torch.Tensor,
+    gain: torch.Tensor,
+    starts: torch.Tensor,
+    peers: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Overlap a read-only input load with a dynamic weight-window stream."""
+    for _program in hl.grid(1):
+        scaled = lhs[:, :] * gain[None, :]
+        for step in hl.tile(1, block_size=1):
+            begin = starts[step.begin] * 128
+            panel = weight[:, begin + hl.arange(128)]
+            projected = torch.matmul(scaled, panel)
+            copy = hl.make_async_remote_copy(
+                projected,
+                [],
+                peers[0],
+                dst=output,
+                dst_index=[0],
+            )
+            copy.start()
+            copy.wait()
+    return output
+
+
+@helion.kernel(
     static_shapes=True,
     config=helion.Config(block_sizes=[]),
 )
@@ -1354,6 +1386,82 @@ class TestRemoteCopyJaxRuntime(TestCase):
         for _invocation in range(2):
             result = np.asarray(jax.block_until_ready(copy(*inputs)))
             np.testing.assert_array_equal(result, expected)
+
+    def test_read_only_input_dma_starts_before_dynamic_weight_wait(self) -> None:
+        args = (
+            torch.zeros(16, 256, dtype=torch.bfloat16),
+            torch.zeros(256, 256, dtype=torch.bfloat16),
+            torch.ones(256, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+            torch.zeros(1, 16, 128, dtype=torch.bfloat16),
+        )
+        source = _overlap_read_only_input_dma.bind(args).to_triton_code()
+        gain_start = source.index("gain_load_copy.start()")
+        gain_wait = source.index("gain_load_copy.wait()")
+        weight_start = source.index("\n    _copy.start()")
+        weight_wait = source.index("\n        _copy_1.wait()")
+        dot = source.index("lax.dot_general")
+        self.assertLess(gain_start, weight_start)
+        self.assertLess(gain_start, gain_wait)
+        self.assertLess(weight_start, weight_wait)
+        self.assertLess(gain_wait, dot)
+        self.assertLess(weight_wait, dot)
+
+    @skipIfPallasInterpret("remote copies require physical TPU devices")
+    def test_read_only_input_dma_overlap_computes_correctly(self) -> None:
+        import jax
+        import jax.numpy as jnp
+
+        devices = [device for device in jax.local_devices() if device.platform == "tpu"]
+        if len(devices) < 2:
+            self.skipTest("requires at least two TPU devices")
+        mesh = jax.make_mesh((2,), ("peer",), devices=devices[:2])
+        partition = jax.sharding.PartitionSpec
+        input_specs = (
+            partition("peer", None),
+            partition(None, None),
+            partition(None),
+            partition("peer"),
+            partition("peer"),
+            partition("peer", None, None),
+        )
+        run = jax.jit(
+            jax.shard_map(
+                _overlap_read_only_input_dma.jax_fn,
+                mesh=mesh,
+                in_specs=input_specs,
+                out_specs=partition("peer", None, None),
+                check_vma=False,
+            )
+        )
+        lhs = jnp.arange(2 * 16 * 256, dtype=jnp.bfloat16).reshape(32, 256)
+        weight = (
+            jnp.arange(256 * 256, dtype=jnp.float32).reshape(256, 256) % 17
+        ).astype(jnp.bfloat16)
+        gain = (1 + jnp.arange(256, dtype=jnp.float32) % 5).astype(jnp.bfloat16)
+        starts = jnp.arange(2, dtype=jnp.int32)
+        peers = jnp.arange(2, dtype=jnp.int32)
+        output = jnp.zeros((2, 16, 128), dtype=jnp.bfloat16)
+        values = (lhs, weight, gain, starts, peers, output)
+        inputs = tuple(
+            jax.device_put(value, jax.sharding.NamedSharding(mesh, spec))
+            for value, spec in zip(values, input_specs, strict=True)
+        )
+        result = jax.block_until_ready(run(*inputs))
+        expected = jnp.stack(
+            [
+                jnp.matmul(
+                    (lhs[rank * 16 : (rank + 1) * 16] * gain[None, :]).astype(
+                        jnp.bfloat16
+                    ),
+                    weight[:, rank * 128 : (rank + 1) * 128],
+                    preferred_element_type=jnp.float32,
+                ).astype(jnp.bfloat16)
+                for rank in range(2)
+            ]
+        )
+        np.testing.assert_array_equal(np.asarray(result), np.asarray(expected))
 
     def test_computed_fp8_source_codegen(self) -> None:
         args = (
