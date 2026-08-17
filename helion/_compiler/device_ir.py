@@ -6,6 +6,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+from itertools import starmap
 import logging
 import math
 import operator
@@ -35,11 +36,19 @@ from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import CoResidencyGroup
 from ..autotuner.config_spec import CuteVectorWidthSpec
+from ..autotuner.config_spec import DotAxes
+from ..autotuner.config_spec import DotAxisKind
+from ..autotuner.config_spec import DotSite
+from ..autotuner.config_spec import KernelMatmulFact
+from ..autotuner.config_spec import LoopAxisFact
 from ..autotuner.config_spec import MatmulWithReductionEpilogueFact
+from ..autotuner.config_spec import PipelinedRegion
 from ..autotuner.config_spec import ReductionCategory
 from ..autotuner.config_spec import ReductionDescriptor
 from ..autotuner.config_spec import ReductionKernelFact
 from ..autotuner.config_spec import ReductionLoopSpec
+from ..autotuner.config_spec import ResidentRegion
+from ..autotuner.config_spec import ResolvedMatmulFact
 from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
@@ -53,6 +62,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
+from .compile_environment import FixedBlockSizeSource
 from .host_function import HostFunction
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
@@ -92,6 +102,7 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
     from .cute.layout import CuTeGridExecutionPlan
+    from .device_ir_analysis import DeviceIRAnalysis
 
     class _TLS(Protocol):
         device_irs: list[DeviceIR]
@@ -786,6 +797,41 @@ def _reduction_fx_inter_loop_rw_names(
     return frozenset(reads), frozenset(writes)
 
 
+def _immovable_extent(
+    env: CompileEnvironment, spec: ConfigSpec, block_id: int
+) -> int | None:
+    """The per-program extent of an axis the config cannot move, or ``None``.
+
+    A ``FixedBlockSizeSource`` is the one source the config cannot move: it returns its own
+    ``value`` and ignores the config entirely. Every other source reads a config knob
+    (``block_sizes`` for a loop axis, ``reduction_loops`` for a reduction one), so the config
+    CAN move it and there is no config-independent extent to report.
+
+    The value is asked of the source rather than read off ``value``, so this stays correct if
+    a fixed source ever computes it. Note the axis's ``size`` is NOT it: ``size`` is the AXIS
+    LENGTH, which for ``hl.tile(seqlen, block_size=64)`` is the whole sequence (8192) rather
+    than the 64 rows one program sees. That distinction is why every footprint resolves
+    extents through ``_full_block_map`` -> ``from_config`` instead of reading ``size``.
+
+    Module-level rather than a closure so it can be tested without building a real graph.
+    """
+    if not (0 <= block_id < len(env.block_sizes)):
+        return None
+    info = env.block_sizes[block_id]
+    if not isinstance(info.block_size_source, FixedBlockSizeSource):
+        return None
+    try:
+        value = info.block_size_source.from_config(spec._base_default_config(), info)
+    except Exception:
+        return None
+    if value is None:
+        return None
+    try:
+        return max(1, int(env.size_hint(value)))
+    except Exception:
+        return None
+
+
 class DeviceIR:
     def __init__(self) -> None:
         super().__init__()
@@ -1083,39 +1129,6 @@ class DeviceIR:
                 )
             )
 
-    def _original_graph_reductions(self) -> list[tuple[int, int]]:
-        """Every reduction OCCURRENCE on the ORIGINAL (pre-roll) device graphs as
-        ``(graph_id, block_id)`` pairs, de-duplicated within a graph (one descriptor per
-        distinct rdim per original graph).
-
-        Rolled ``ReductionLoopGraphInfo`` subgraphs are EXCLUDED: they are copies the roller
-        creates for one config, so their ``graph_id`` is contingent on the autotuner flipping a
-        ``reduction_loops`` knob. The original graphs carry the faithful co-residency structure
-        (PROMPT §2.2 / §2.7): two distinct rdims sharing an original graph were fused by the
-        compiler -> co-resident; the same rdim in two original graphs is two sequential passes
-        (jsd's two V-reductions). Verified against the IR (``_lab/redesign/ir_*.json``): rolled
-        subgraphs are exactly ``ReductionLoopGraphInfo``.
-        """
-        from .inductor_lowering import ReductionLowering
-
-        seen: set[tuple[int, int]] = set()
-        out: list[tuple[int, int]] = []
-        for gi in self.graphs:
-            if isinstance(gi, ReductionLoopGraphInfo):
-                continue
-            for node in gi.graph.nodes:
-                lowering = node.meta.get("lowering")
-                if not isinstance(lowering, ReductionLowering):
-                    continue
-                bid = getattr(lowering, "block_index", None)
-                if bid is None:
-                    continue
-                key = (gi.graph_id, bid)
-                if key not in seen:
-                    seen.add(key)
-                    out.append(key)
-        return out
-
     def _categorize_reduction(
         self, block_id: int, grid_ids: set[int]
     ) -> ReductionCategory:
@@ -1161,134 +1174,11 @@ class DeviceIR:
             )
         return ReductionCategory.FULL_SLICE
 
-    def _group_live_tiles(
-        self, group_gids: list[int], env: CompileEnvironment
-    ) -> dict[int, list[tuple[int | None, ...]]]:
-        """Attribute the resident tile set to each co-residency group. Returns ``{group_gid:
-        [dim_block_ids, ...]}`` — the peak live set (``_graph_peak_live_tiles``) of the group's home
-        graph, combined with the for-loop bodies the group drives. Four attribution rules:
-
-        1. **Descend driven for-loop bodies to the ancestor group.** The heavy tiles often live in a
-           for-loop body the group's home graph drives (via a ``loop->child`` edge), not in the thin
-           home graph itself. A loop body is owned by the group whose reduction loops over its axis
-           (the loop's ``block_ids`` intersect the group's reduction axes).
-
-        2. **Skip ``ReductionLoopGraphInfo`` copies.** The roller's per-config duplicates carry a
-           strict subset of the original graph's pre-roll body, so the original graph the group is
-           keyed on already holds the peak.
-
-        3. **Do not cross ``_if`` edges.** If/Else branch subtrees are their own groups or mutually
-           exclusive with a sibling; a parent group never absorbs a branch's tiles. Branches combine
-           via rule 4's max, not by summing into an ancestor.
-
-        4. **Combine a group's owned graphs by max-by-profile, never sum.** Co-resident reductions
-           share one original graph by construction, so their simultaneous residency is already
-           inside that graph's peak snapshot. A group's other owned graphs are only ever nested
-           (home + driven body) or If/Else siblings (max picks the populated branch), never
-           simultaneously-additively resident, so max is both faithful and conservative.
-        """
-        from .inductor_lowering import ReductionLowering
-
-        def reds_in(gid: int) -> set[int]:
-            out: set[int] = set()
-            for node in self.graphs[gid].graph.nodes:
-                low = node.meta.get("lowering")
-                if isinstance(low, ReductionLowering) and isinstance(
-                    getattr(low, "block_index", None), int
-                ):
-                    out.add(low.block_index)
-            return out
-
-        # A group is keyed on its home (original) graph_id; its reduction axes come from that graph.
-        group_axes = {gid: reds_in(gid) for gid in group_gids}
-
-        # Peak live-tile snapshot per graph (skip rolled copies — rule 2).
-        peak_of: dict[int, list[tuple[int | None, ...]]] = {}
-        for gi in self.graphs:
-            if isinstance(gi, ReductionLoopGraphInfo):
-                continue
-            peak_of[gi.graph_id] = _graph_peak_live_tiles(gi.graph, env)
-
-        # For-loop child edges (loop->body), keyed by the loop's block_ids (rule 1). ``_if`` edges are
-        # deliberately NOT followed (rule 3) — see the helper.
-        child_loops = self._forloop_child_edges()
-
-        def max_by_profile(
-            a: list[tuple[int | None, ...]], b: list[tuple[int | None, ...]]
-        ) -> list[tuple[int | None, ...]]:
-            mr = max(
-                (_tile_rank(t) for t in a + b),
-                default=0,
-            )
-            ka = _tile_set_rank_profile(a, mr)
-            kb = _tile_set_rank_profile(b, mr)
-            return a if ka >= kb else b
-
-        group_key_set = set(group_gids)
-        result: dict[int, list[tuple[int | None, ...]]] = {}
-        for gid in group_gids:
-            axes = group_axes[gid]
-            tiles = list(peak_of.get(gid, []))
-            # Descend, transitively, the for-loop bodies this group drives (rule 1): a body whose
-            # loop axis is one of the group's reduction axes. Combine each by max-by-profile. Stop
-            # at any body that is itself another group's home (its own sequential group) and never
-            # cross ``_if`` (branch subtrees are handled by their own group keys — rule 3). A BFS so
-            # a home -> loop -> loop chain is fully covered, not just one level. ``not axes`` cannot
-            # happen for a real group key (its home graph holds >=1 reduction lowering).
-            seen_bodies: set[int] = {gid}
-            frontier = [gid]
-            while frontier:
-                cur = frontier.pop()
-                for body_gid, blk in child_loops.get(cur, []):
-                    if body_gid in seen_bodies or body_gid in group_key_set:
-                        continue
-                    if not axes or (blk & axes):
-                        seen_bodies.add(body_gid)
-                        tiles = max_by_profile(tiles, peak_of.get(body_gid, []))
-                        frontier.append(body_gid)
-            result[gid] = tiles
-        return result
-
-    def _forloop_child_edges(self) -> dict[int, list[tuple[int, frozenset[int]]]]:
-        """The for-loop child-edge map for ``_group_live_tiles`` rule 1: for each non-rolled graph,
-        the ``(body_graph_id, frozenset(body_block_ids))`` of every for-loop it drives. Keyed by the
-        parent graph_id; ``child_loops[gid] = [(body_gid, block_ids), ...]``.
-
-        A pure node scan over ``self.graphs`` (the SAME scan the CF walker uses): follows only
-        ``is_for_loop_target`` call_functions whose first arg is the body graph id. ``_if`` edges are
-        deliberately NOT collected (rule 3 — branch subtrees are their own groups). Rolled
-        (``ReductionLoopGraphInfo``) parents and bodies are skipped (rule 2)."""
-        n = len(self.graphs)
-        child_loops: dict[int, list[tuple[int, frozenset[int]]]] = {}
-        for gi in self.graphs:
-            if isinstance(gi, ReductionLoopGraphInfo):
-                continue
-            edges: list[tuple[int, frozenset[int]]] = []
-            for node in gi.graph.nodes:
-                if node.op != "call_function":
-                    continue
-                if (
-                    _tracing_ops.is_for_loop_target(node.target)
-                    and node.args
-                    and isinstance(node.args[0], int)
-                ):
-                    body_gid = node.args[0]
-                    if 0 <= body_gid < n and not isinstance(
-                        self.graphs[body_gid], ReductionLoopGraphInfo
-                    ):
-                        blk = frozenset(
-                            getattr(self.graphs[body_gid], "block_ids", []) or []
-                        )
-                        edges.append((body_gid, blk))
-            if edges:
-                child_loops[gi.graph_id] = edges
-        return child_loops
-
     def build_reduction_kernel_fact(
         self,
         memory_op_facts: list[MemoryOpFact],
         accumulator_facts: list[AccumulatorFact],
-        liveness_by_axis: dict[int, int] | None = None,
+        analysis: DeviceIRAnalysis,
     ) -> None:
         """Build the categorizing ``ReductionKernelFact`` — the list of reduction descriptors +
         their ``graph_id`` co-residency groups + the non-reduction loops + the parallel grid axes.
@@ -1296,10 +1186,9 @@ class DeviceIR:
         """
         env = CompileEnvironment.current()
         spec = env.config_spec
-        liveness_by_axis = liveness_by_axis or {}
         grid_ids = {b for bids in self.grid_block_ids for b in bids}
 
-        occurrences = self._original_graph_reductions()
+        occurrences = analysis.original_reductions()
         # carried-2D tiles: count of accumulators whose last dim is the rdim (per block_id,
         # kernel-wide -- an accumulator is carried across the whole inner loop, so it is not
         # graph-scoped). A count (not a bool) is load-bearing: the carried byte cap divides the
@@ -1318,16 +1207,14 @@ class DeviceIR:
             size_hint = (
                 info.size_hint() if isinstance(info.size, (int, torch.SymInt)) else 0
             )
-            per = self._per_reduction_memory_fields(
-                bid, gid, memory_op_facts, liveness_by_axis
-            )
+            per = self._per_reduction_memory_fields(bid, gid, memory_op_facts)
             descriptors.append(
                 ReductionDescriptor(
                     category=category,
                     block_id=bid,
                     graph_id=gid,
                     size_hint=size_hint,
-                    itemsize=self._reduction_input_itemsize(bid),
+                    itemsize=analysis.reduction_input_itemsize(bid),
                     input_load_itemsize=per["input_load_itemsize"],
                     carried_2d_count=carried_2d_by_bid.get(bid, 0),
                     row_reread=per["row_reread"],
@@ -1347,17 +1234,11 @@ class DeviceIR:
         # driven-loop-bodies, max'd across If/Else. Consumed by the Stage-2 footprint (which sums
         # ∏(dims) per actual tile).
         #
-        # The try/except is NECESSARY: ``_group_live_tiles`` walks the graphs through ``env`` (block
-        # id resolution in ``_graph_peak_live_tiles``), which a bare-spec unit test builds the fact
-        # WITHOUT -> the walk raises before producing tiles. The fallback degrades to empty tiles
-        # (the Stage-2 allocator then falls back to its extent-based footprint), so a missing env
-        # yields a valid-but-coarser fact rather than a crash. Trade-off to be aware of: the broad
-        # catch also swallows a genuine graph-structure bug INSIDE the walk as a silent empty-tiles
-        # perf regression (not a crash) — acceptable because the walk is best-effort attribution, but
-        # if this ever needs tightening, catch ``NoCurrentEnvironment`` specifically (the real no-env
-        # trigger) rather than the broad trio.
+        # Preserve the legacy best-effort fallback: incomplete graph metadata
+        # yields an extent-based footprint rather than failing fact construction.
+        # The focused reduction corpus keeps this liveness-derived field pinned.
         try:
-            group_live = self._group_live_tiles(sorted(groups_by_gid), env)
+            group_live = analysis.group_live_tiles(sorted(groups_by_gid))
         except (KeyError, AttributeError, TypeError):
             group_live = {}
         coresidency_groups = tuple(
@@ -1395,7 +1276,6 @@ class DeviceIR:
         red_block_id: int,
         graph_id: int,
         memory_op_facts: list[MemoryOpFact],
-        liveness_by_axis: dict[int, int],
     ) -> dict:
         """The memory-op-derived per-reduction fields, computed exactly as
         ``_assemble_reduction_fact`` does (so a descriptor is field-equal to the legacy fact),
@@ -1446,6 +1326,442 @@ class DeviceIR:
             "reread_eviction_index": reread_eviction_index,
             "input_load_itemsize": input_load_itemsize,
         }
+
+    def build_kernel_matmul_fact(self, analysis: DeviceIRAnalysis) -> None:
+        """Compose the whole-kernel ``KernelMatmulFact`` for any kernel with contractions.
+
+        Built unconditionally (not only for MULTI-dot kernels) so the single-matmul and
+        multi-matmul seeds read ONE description of the workload and differ only in policy;
+        that is what keeps workload analysis independent of heuristic execution order.
+
+        Four pieces of analysis, none of which mentions a kernel name or a semantic role:
+
+        1. **Axis classification** per dot (:class:`DotAxes`). An M/N/K axis is tunable when
+           it has a block id that is in ``valid_block_ids()``; fixed-full-extent when its
+           extent is statically known but it has no tunable block id (the author
+           ``hl.specialize``\\d it, so there is no loop over it and no block size to set);
+           unknown when there is no static extent at all.
+        2. **Knob competition**: which dots' axes map onto each tunable block id. A knob
+           used by two dots must be resolved by ranking rather than by whichever dot the
+           code happened to look at first.
+        3. **Placement and work** per dot (:class:`DotSite`): the enclosing sequential loop
+           trip count (how many times one program runs this dot) and whether it updates a
+           loop-carried value. Attribution of a trace-order ``MatmulFact`` to a graph node is
+           a COMPUTED pairing with a post-condition (the paired node's M/N/K extents must
+           match the fact); ``attribution_complete`` is False when the post-condition fails,
+           so a consumer never silently trusts a wrong pairing.
+        4. **Peak liveness** for the whole kernel, from the same last-use sweep the reduction
+           fact uses, retaining element width and producer class so a resource estimate can
+           charge tensor memory, shared memory and registers separately.
+        """
+        env = CompileEnvironment.current()
+        spec = env.config_spec
+        facts = spec.matmul_facts
+        if not facts:
+            return
+
+        valid = set(spec.block_sizes.valid_block_ids())
+
+        def classify(
+            block_id: int | None, static: int | None
+        ) -> tuple[DotAxisKind, int | None]:
+            if block_id is not None and block_id in valid:
+                return DotAxisKind.TUNABLE_TILED, static
+            # Not tunable. The per-program extent is what the axis's source pins it to,
+            # which is knowable even when the axis LENGTH is dynamic: a chunked kernel that
+            # walks a runtime-length sequence in fixed 64-row tiles has an unknown total
+            # length and a perfectly known 64-row contraction. Tile budgets consume the
+            # per-program extent; only the grid and trip count need the length. Reporting
+            # such an axis as UNKNOWN declines a kernel that can be configured exactly --
+            # measured, it is the sole reason 26 curriculum cases received no seed at all.
+            if block_id is not None:
+                extent = _immovable_extent(env, spec, block_id)
+                if extent is not None:
+                    return DotAxisKind.FIXED_FULL_EXTENT, extent
+            if static is None:
+                return DotAxisKind.UNKNOWN, None
+            return DotAxisKind.FIXED_FULL_EXTENT, static
+
+        axes: list[DotAxes] = []
+        for f in facts:
+            mk, me = classify(f.m_block_id, f.static_m)
+            nk, ne = classify(f.n_block_id, f.static_n)
+            kk, ke = classify(f.k_block_id, f.static_k)
+            axes.append(DotAxes(mk, nk, kk, me, ne, ke))
+
+        # (2) knob competition
+        users: dict[int, list[tuple[int, str]]] = {}
+        for i, f in enumerate(facts):
+            for axis, bid in (
+                ("m", f.m_block_id),
+                ("n", f.n_block_id),
+                ("k", f.k_block_id),
+            ):
+                if bid is not None and bid in valid:
+                    users.setdefault(bid, []).append((i, axis))
+
+        # (3) placement + work. Sequential loop trip counts come from the for-loop child
+        # edge map, so a dot inside a chunk walk is charged that walk's length.
+        parent_of = analysis.parent_of
+        loop_block_ids = analysis.loop_block_ids
+        loop_calls = analysis.loop_calls
+
+        def _axis_extent_or_none(bid: int) -> int | None:
+            if 0 <= bid < len(env.block_sizes):
+                size = env.block_sizes[bid].size
+                if isinstance(size, (int, torch.SymInt)):
+                    try:
+                        return max(1, int(env.size_hint(size)))
+                    except Exception:
+                        return None
+            return None
+
+        def _axis_extent(bid: int) -> int:
+            return _axis_extent_or_none(bid) or 1
+
+        grid_ids = set(spec.grid_block_ids)
+        mn_ids = {f.m_block_id for f in facts} | {f.n_block_id for f in facts}
+        outer_grid = 1
+        for bid in spec.grid_block_ids:
+            if bid in mn_ids:
+                continue
+            outer_grid *= _axis_extent(bid)
+
+        bounded_by: dict[int, int] = {}
+        bounded_extent: dict[int, int] = {}
+        for slot in range(len(spec.block_sizes)):
+            block_spec = spec.block_sizes[slot]
+            parent = getattr(block_spec, "bounded_by_block_id", None)
+            if isinstance(parent, int):
+                bounded_by[block_spec.block_id] = parent
+                if 0 <= parent < len(env.block_sizes):
+                    source = env.block_sizes[parent].block_size_source
+                    value = getattr(source, "value", None)
+                    if isinstance(source, FixedBlockSizeSource) and isinstance(
+                        value, int
+                    ):
+                        bounded_extent[block_spec.block_id] = max(1, value)
+
+        inferred_work_trips: dict[tuple[int, int], int] = {}
+
+        def loop_axes_for(graph_id: int) -> tuple[LoopAxisFact, ...]:
+            """Sequential loop axes enclosing ``graph_id``, before tile selection.
+
+            A fact is retained instead of prematurely collapsing an extent to a trip
+            count.  The heuristic can then divide by the candidate's real block size.
+            """
+            axes_out: list[LoopAxisFact] = []
+            seen_graphs: set[int] = set()
+            seen_axes: set[int] = set()
+            cur = graph_id
+            while cur in loop_block_ids and cur not in seen_graphs:
+                seen_graphs.add(cur)
+                for bid in sorted(loop_block_ids[cur]):
+                    if bid in grid_ids or bid in seen_axes:
+                        continue
+                    seen_axes.add(bid)
+                    axes_out.append(
+                        LoopAxisFact(
+                            bid,
+                            _axis_extent_or_none(bid),
+                            bounded_by.get(bid),
+                            bounded_extent.get(bid),
+                        )
+                    )
+                cur = parent_of.get(cur, -1)
+            return tuple(axes_out)
+
+        def trips_for(graph_id: int) -> int:
+            """Iterations one program runs a dot in this graph: the product over the
+            ANCESTOR CHAIN of loops enclosing it (never across sibling loops -- two
+            sequential loops in one kernel run one after the other, so their trip counts
+            add, they do not multiply).
+
+            A loop over an axis the config cannot move runs ``length / block`` times, not
+            ``length`` times -- a 128x over-count for a 64-row tile over an 8192-long
+            sequence. An axis whose block size IS still tunable contributes its full extent,
+            i.e. its trip count at the smallest legal block: an UPPER bound, which is the
+            safe direction, since every consumer uses this only to CAP a pipeline depth.
+            """
+            trips = 1
+            for axis in loop_axes_for(graph_id):
+                extent = axis.extent or 1
+                if axis.bounded_by_block_id is not None:
+                    extent = (
+                        axis.bounded_extent
+                        or _immovable_extent(
+                            env,
+                            spec,
+                            axis.bounded_by_block_id,
+                        )
+                        or _axis_extent(axis.bounded_by_block_id)
+                    )
+                block = _immovable_extent(env, spec, axis.block_id)
+                trips *= max(1, -(-extent // block)) if block else extent
+            return trips
+
+        from .device_ir_analysis import matmul_operand_positions
+        from .device_ir_analysis import trace_back_to_load
+
+        dot_targets = matmul_operand_positions()
+        dot_nodes = analysis.dot_nodes
+
+        def _strip_index_cast(value: object) -> object:
+            for _ in range(4):
+                if not isinstance(value, torch.fx.Node) or value.target not in (
+                    torch.ops.prims.convert_element_type.default,
+                    torch.ops.aten._to_copy.default,
+                ):
+                    break
+                value = value.args[0]
+            return value
+
+        def _single_segment_loop(body_gid: int, block_id: int) -> bool:
+            """Whether this loop walks the sole segment in a length-2 offsets array."""
+            calls = loop_calls.get(body_gid, ())
+            if len(calls) != 1:
+                return False
+            graph_info = self.graphs[body_gid]
+            body_block_ids = getattr(graph_info, "block_ids", ())
+            if block_id not in body_block_ids:
+                return False
+            position = body_block_ids.index(block_id)
+            call = calls[0]
+            ends = call.args[2] if len(call.args) > 2 else None
+            if not isinstance(ends, (list, tuple)) or position >= len(ends):
+                return False
+
+            difference = _strip_index_cast(ends[position])
+            if (
+                not isinstance(difference, torch.fx.Node)
+                or difference.target is not torch.ops.aten.sub.Tensor
+            ):
+                return False
+            end = _strip_index_cast(difference.args[0])
+            begin = _strip_index_cast(difference.args[1])
+
+            from ..language import memory_ops
+
+            if (
+                not isinstance(end, torch.fx.Node)
+                or end.target is not memory_ops.load
+                or not isinstance(begin, torch.fx.Node)
+                or begin.target is not memory_ops.load
+                or end.args[0] is not begin.args[0]
+            ):
+                return False
+            offsets = _accessed_tensor_fake(end)
+            if (
+                offsets is None
+                or offsets.ndim != 1
+                or env.size_hint(offsets.shape[0]) != 2
+            ):
+                return False
+            end_indices = end.args[1] if len(end.args) > 1 else None
+            begin_indices = begin.args[1] if len(begin.args) > 1 else None
+            if (
+                not isinstance(end_indices, (list, tuple))
+                or len(end_indices) != 1
+                or not isinstance(begin_indices, (list, tuple))
+                or len(begin_indices) != 1
+            ):
+                return False
+            end_index = _strip_index_cast(end_indices[0])
+            begin_index = _strip_index_cast(begin_indices[0])
+            if not isinstance(end_index, torch.fx.Node):
+                return False
+            if end_index.target not in (
+                operator.add,
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.add.Scalar,
+            ):
+                return False
+            lhs, rhs = end_index.args[:2]
+            return (lhs is begin_index and isinstance(rhs, int) and rhs == 1) or (
+                rhs is begin_index and isinstance(lhs, int) and lhs == 1
+            )
+
+        def _direct_operand_trip_count(
+            node: torch.fx.Node,
+            operand_index: int,
+        ) -> tuple[int, int] | None:
+            """Return ``(load identity, loop trips)`` proven by one direct operand."""
+            from ..language import memory_ops
+
+            if operand_index >= len(node.args):
+                return None
+            operand = node.args[operand_index]
+            load = trace_back_to_load(operand, memory_ops.load)
+            if load is None or not isinstance(operand, torch.fx.Node):
+                return None
+            source = _accessed_tensor_fake(load)
+            operand_value = operand.meta.get("val")
+            if source is None or not isinstance(operand_value, torch.Tensor):
+                return None
+
+            source_numel = 1
+            for size, stride in zip(source.shape, source.stride(), strict=True):
+                if stride != 0:
+                    source_numel *= max(1, env.size_hint(size))
+            operand_numel = 1
+            for size in operand_value.shape:
+                operand_numel *= max(1, env.size_hint(size))
+            denominator = max(1, outer_grid) * operand_numel
+            if source_numel % denominator:
+                return None
+            return id(load), max(1, source_numel // denominator)
+
+        # A runtime offsets load normally makes a segmented loop's trip count
+        # unknowable. With exactly one segment, however, two independently loaded
+        # dot operands can prove it from shapes: total accessed elements divided by
+        # the parallel grid and one operand tile is the number of dynamic dot calls.
+        # Requiring two distinct loads to agree prevents a broadcast or shared
+        # operand from turning a weak shape ratio into an exact loop fact.
+        dots_by_graph: dict[int, list[torch.fx.Node]] = {}
+        for gid, node in dot_nodes:
+            dots_by_graph.setdefault(gid, []).append(node)
+        for body_gid, block_ids in loop_block_ids.items():
+            unresolved = [
+                bid
+                for bid in block_ids
+                if bid not in grid_ids
+                and _axis_extent_or_none(bid) is None
+                and bid not in bounded_by
+            ]
+            enclosing_axes = loop_axes_for(body_gid)
+            if len(block_ids) != 1 or len(unresolved) != 1 or len(enclosing_axes) != 1:
+                continue
+            block_id = unresolved[0]
+            if not _single_segment_loop(body_gid, block_id):
+                continue
+            block = _immovable_extent(env, spec, block_id)
+            if block is None:
+                continue
+            trip_by_load: dict[int, int] = {}
+            for node in dots_by_graph.get(body_gid, ()):
+                positions = dot_targets.get(node.target)
+                if positions is None:
+                    continue
+                for operand_index in positions:
+                    proof = _direct_operand_trip_count(node, operand_index)
+                    if proof is not None:
+                        trip_by_load[proof[0]] = proof[1]
+            trips = set(trip_by_load.values())
+            if len(trip_by_load) >= 2 and len(trips) == 1:
+                inferred_work_trips[(body_gid, block_id)] = trips.pop()
+
+        n_dot_nodes = len(dot_nodes)
+        attribution_complete = n_dot_nodes == len(facts)
+        sites: list[DotSite] = []
+
+        if attribution_complete:
+            for i, (gid, node) in enumerate(dot_nodes):
+                val = node.meta.get("val")
+                # POST-CONDITION on the positional pairing: the node's own output extents
+                # must agree with the fact's M/N. If they do not, the pairing is not proven
+                # and every per-dot placement field becomes untrusted (flag cleared below).
+                if isinstance(val, torch.Tensor) and val.ndim >= 2:
+                    got = []
+                    for dim in val.shape[-2:]:
+                        blk = env.resolve_block_id(dim)
+                        if blk is not None and 0 <= blk < len(env.block_sizes):
+                            dim = env.block_sizes[blk].size
+                        if not isinstance(dim, (int, torch.SymInt)):
+                            got.append(-1)
+                            continue
+                        try:
+                            got.append(int(env.size_hint(dim)))
+                        except Exception:
+                            got.append(-1)
+                    want = [facts[i].static_m, facts[i].static_n]
+                    if any(
+                        w is not None and g != -1 and w != g
+                        for w, g in zip(want, got, strict=False)
+                    ):
+                        attribution_complete = False
+                # A dot updates a loop-carried value iff its result REACHES the body
+                # graph's ``output`` node, i.e. it is part of what the next iteration
+                # carries in. Testing the dot's direct users is not enough: the carry
+                # normally passes through a cast or a decay multiply first.
+                updates_carry = (
+                    analysis.by_id[gid].reaches_output(node) and gid in loop_block_ids
+                )
+                loop_axes = loop_axes_for(gid)
+                exact_loop_trips = (
+                    inferred_work_trips.get((gid, loop_axes[0].block_id))
+                    if len(loop_axes) == 1
+                    else None
+                )
+                sites.append(
+                    DotSite(
+                        gid,
+                        trips_for(gid),
+                        updates_carry,
+                        loop_axes,
+                        exact_loop_trips,
+                    )
+                )
+        if not attribution_complete:
+            # Unproven pairing: keep a same-length, deliberately uninformative site list so
+            # consumers never index out of range, and let the flag carry the uncertainty.
+            sites = [DotSite(-1, 1, False, (), None) for _ in facts]
+
+        # (3c) sequential (non-grid) loop trip count over the whole kernel: the chunk walk of
+        # a state recurrence. ``sequential_loop_trips * fixed_k`` recovers the logical
+        # contraction length when each dot only ever sees one chunk. The MAX over loop nests,
+        # not the product over all of them: two sequential loops in one kernel run one after
+        # the other (their iterations add), only a nest multiplies.
+        seq_trips = 1
+        for body_gid, blk in loop_block_ids.items():
+            if any(bid in spec.grid_block_ids for bid in blk):
+                continue
+            seq_trips = max(seq_trips, trips_for(body_gid))
+
+        # (4) Shared liveness views all derive from the analysis layer's one
+        # last-use table per graph.
+        best = analysis.kernel_peak_live_tiles()
+        best_acc = analysis.kernel_peak_dot_outputs()
+        all_steps = analysis.kernel_live_tile_steps()
+
+        # (5) memory regions, split by whether the software pipeliner multi-buffers them.
+        # A LOOP BODY's loads are staged num_stages deep; a load in a non-loop graph is
+        # issued once. Charging the latter per stage over-states shared memory badly enough
+        # to shrink a tile to the dot minimum for an overflow that cannot happen.
+        pipelined: list[PipelinedRegion] = []
+        resident: list[ResidentRegion] = []
+        for graph_analysis in analysis.non_reduction_graphs:
+            loop_axes = (
+                loop_axes_for(graph_analysis.graph_id)
+                if graph_analysis.graph_id in loop_block_ids
+                else ()
+            )
+            tiles = graph_analysis.memory_tiles_for_loop_axes(
+                env,
+                frozenset(axis.block_id for axis in loop_axes),
+            )
+            if not tiles:
+                continue
+            if graph_analysis.graph_id in loop_block_ids:
+                pipelined.append(PipelinedRegion(loop_axes, tuple(tiles)))
+            else:
+                resident.append(ResidentRegion(tuple(tiles)))
+
+        resolved = tuple(
+            starmap(ResolvedMatmulFact, zip(facts, axes, sites, strict=True))
+        )
+        spec.kernel_matmul_fact = KernelMatmulFact(
+            matmuls=resolved,
+            knob_users=tuple((bid, tuple(users[bid])) for bid in sorted(users)),
+            outer_grid=outer_grid,
+            sequential_loop_trips=seq_trips,
+            live_tiles=tuple(best),
+            live_dot_outputs=tuple(best_acc),
+            live_tile_steps=tuple(all_steps),
+            pipelined_regions=tuple(pipelined),
+            resident_regions=tuple(resident),
+            n_dot_nodes=max(n_dot_nodes, len(facts)),
+            attribution_complete=attribution_complete,
+        )
 
     def build_matmul_reduction_epilogue_facts(self) -> None:
         """Phase 4: compose a ``MatmulWithReductionEpilogueFact`` for a fused matmul +
@@ -1812,30 +2128,6 @@ class DeviceIR:
                 matches,
             )
         return None
-
-    def _reduction_input_itemsize(self, red_block_id: int) -> int:
-        """Element size (bytes) of the tensor reduced over ``red_block_id`` — read from the
-        reduction node's INPUT (not its ``meta['val']`` output, which may differ in dtype,
-        e.g. argmax). Helion fp32-promotes the norm/softmax family, so this is 4 at both
-        bf16 and fp32 there. All reductions over one rdim share an input element size (last
-        wins). The byte caps key on ``size_hint * itemsize``.
-        """
-        from .inductor_lowering import ReductionLowering
-
-        itemsize = 0
-        for graph_info in self.graphs:
-            for node in graph_info.graph.nodes:
-                lowering = node.meta.get("lowering")
-                if (
-                    isinstance(lowering, ReductionLowering)
-                    and getattr(lowering, "block_index", None) == red_block_id
-                ):
-                    for inp in node.all_input_nodes:
-                        in_val = inp.meta.get("val")
-                        if isinstance(in_val, torch.Tensor):
-                            itemsize = in_val.element_size()
-                            break
-        return itemsize
 
     def _is_fully_resident_grid_axis(self, block_id: int) -> bool:
         """True iff a grid axis is tiled at its FULL extent (``block_size == extent`` =>
@@ -3133,49 +3425,6 @@ class WalkHostAST(NodeVisitor):
             self.current_phase_roots = []
 
 
-# Matmul/dot FX targets mapped to (lhs_arg_index, rhs_arg_index). Used to tag
-# which load nodes feed a matmul (and as which operand) at the recognition site,
-# instead of scanning every load's downstream users.
-def _matmul_operand_positions() -> dict[object, tuple[int, int]]:
-    from ..language import matmul_ops
-
-    return {
-        # mat1=0, mat1_scale=1, mat1_format=2, mat2=3 -> lhs/rhs matrices are 0/3
-        matmul_ops.dot_scaled: (0, 3),
-        matmul_ops.dot: (0, 1),
-        torch.ops.aten.mm.default: (0, 1),
-        torch.ops.aten.bmm.default: (0, 1),
-        torch.ops.aten.addmm.default: (1, 2),
-        torch.ops.aten.baddbmm.default: (1, 2),
-    }
-
-
-def _trace_back_to_load(arg: object, load_op: object) -> torch.fx.Node | None:
-    """Follow a matmul operand back through pass-through ops to its load node.
-
-    Only follows single-input pass-through ops (cast / transpose / view / unary
-    elementwise), so an operand that is a genuine computation of two loads (e.g.
-    ``a[...] + bias[...]``) is left untagged rather than mis-attributed to its
-    first input. Returns the producing ``hl.load`` node, or ``None``.
-    """
-    cur = arg
-    for _ in range(8):
-        if not isinstance(cur, torch.fx.Node):
-            return None
-        if cur.target is load_op:
-            return cur
-        tensor_inputs = [
-            a
-            for a in cur.args
-            if isinstance(a, torch.fx.Node)
-            and isinstance(a.meta.get("val"), torch.Tensor)
-        ]
-        if len(tensor_inputs) != 1:
-            return None
-        cur = tensor_inputs[0]
-    return None
-
-
 def _load_needs_eviction_tunable(node: torch.fx.Node) -> bool:
     """A load gets an eviction-policy slot only when the user did not pass one."""
     eviction_policy_arg = node.kwargs.get("eviction_policy")
@@ -3200,136 +3449,9 @@ def _subscript_block_id(env: CompileEnvironment, sub: object) -> int | None:
     return info.block_id if info is not None else None
 
 
-def _tile_rank(dims: tuple[int | None, ...]) -> int:
-    """The number of BLOCK dims a tile spans (``None`` static/broadcast dims do not count) — the
-    block-size-free proxy for tile bytes used by the lexicographic peak selector."""
-    return sum(1 for d in dims if d is not None)
-
-
-def _tile_set_rank_profile(
-    tiles: list[tuple[int | None, ...]], max_rank: int
-) -> tuple[int, ...]:
-    """A tile set's RANK PROFILE as a lexicographic key over ABSOLUTE ranks, HIGHEST rank first:
-    index 0 is the count of rank-``max_rank`` tiles, ..., last is the count of rank-1 tiles. More
-    top-rank tiles wins; equal-top-rank falls through to the next rank down. Fixed length so the
-    same rank aligns when comparing two tile sets (a per-set-length key would compare one set's
-    rank-2 count against another's rank-1 count and mis-rank a scalar swarm as the winner)."""
-    by_rank: dict[int, int] = {}
-    for t in tiles:
-        r = _tile_rank(t)
-        if r:
-            by_rank[r] = by_rank.get(r, 0) + 1
-    return tuple(by_rank.get(k, 0) for k in range(max_rank, 0, -1))
-
-
-def _graph_peak_live_by_axis(
-    graph: torch.fx.Graph, env: CompileEnvironment
-) -> dict[int, int]:
-    """Peak count of simultaneously-live tensor values whose shape spans each
-    block-id axis, over ONE graph -- a liveness sweep in FX topo order.
-    Consumer-AGNOSTIC per-axis provenance keyed by block_id; a consumer reads its
-    own axis slice.
-
-    A value is live from definition through its last use in the graph. At each
-    step the sweep counts live values whose ``meta['val'].shape`` includes an axis
-    and tracks the per-axis peak. A CONSERVATIVE over-count of register pressure
-    (no remat / reuse beyond last-use modeled), so a heavy body is never
-    under-counted into an unsafe persistent spill.
-    """
-    nodes = list(graph.nodes)
-    last_use: dict[torch.fx.Node, int] = {}
-    for i, node in enumerate(nodes):
-        for inp in node.all_input_nodes:
-            last_use[inp] = i
-    axes_of: dict[torch.fx.Node, frozenset[int]] = {}
-    for node in nodes:
-        val = node.meta.get("val")
-        if isinstance(val, torch.Tensor):
-            axes = {
-                bid for s in val.shape if (bid := env.resolve_block_id(s)) is not None
-            }
-            if axes:
-                axes_of[node] = frozenset(axes)
-    peak: dict[int, int] = {}
-    live: set[torch.fx.Node] = set()
-    for i, node in enumerate(nodes):
-        if node in axes_of:
-            live.add(node)
-        per_axis: dict[int, int] = {}
-        for v in live:
-            for a in axes_of[v]:
-                per_axis[a] = per_axis.get(a, 0) + 1
-        for a, c in per_axis.items():
-            if c > peak.get(a, 0):
-                peak[a] = c
-        live = {v for v in live if last_use.get(v, -1) > i}
-    return peak
-
-
-def _graph_peak_live_tiles(
-    graph: torch.fx.Graph, env: CompileEnvironment
-) -> list[tuple[int | None, ...]]:
-    """The per-tile shapes of the simultaneously-live tensors at the graph's peak-live step.
-
-    Each live tile is recorded as its ``dim_block_ids`` tuple (one entry per shape dim: the block
-    id it spans, or ``None`` for a non-block/constant dim), the same representation as
-    ``AccumulatorFact.dim_block_ids``, so a footprint can sum ``∏(dims)`` per actual tile shape
-    rather than assuming every live tile is full-rank over all axes.
-
-    Which step is "peak"? Register/SRAM pressure is maximized at the step holding the most bytes,
-    but tile bytes depend on the not-yet-chosen block sizes. Rank is the block-size-free proxy for
-    "big": a rank-2 ``[m, r]`` tile is ``m_block × r_block`` elements vs ``m_block`` for a rank-1
-    ``[m]``, so one higher-rank tile outweighs any number of lower-rank tiles. We pick the step
-    whose live set is lexicographically greatest by rank profile — the tuple ``(#rank-D tiles,
-    #rank-(D-1) tiles, ..., #rank-1 tiles)`` compared most-dims-first — so a step with one ``[m, r]``
-    beats a step with many scalar ``[m]`` carries. Maximizing the top-rank count first captures the
-    most heavy R-scaling tiles (the term that prevents spills); lower-rank ties break to more
-    next-heaviest, then to the first such step.
-
-    Returns the actual co-resident live set at that one real step (never a per-shape union across
-    steps, which would stitch together shapes that never coexist). The "1 higher-rank beats any
-    number of lower-rank" tie-rule is not byte-exact in a pathological extreme (hundreds of rank-n
-    tiles vs one rank-(n+1)), but a higher-rank tile contains a lower-rank one as a factor and the
-    miss errs toward a slightly larger R (bounded by the persistence/chunk math) — a stated
-    heuristic, not a random choice.
-    """
-    nodes = list(graph.nodes)
-    last_use: dict[torch.fx.Node, int] = {}
-    for i, node in enumerate(nodes):
-        for inp in node.all_input_nodes:
-            last_use[inp] = i
-    shape_of: dict[torch.fx.Node, tuple[int | None, ...]] = {}
-    for node in nodes:
-        val = node.meta.get("val")
-        if isinstance(val, torch.Tensor) and val.shape:
-            dims = tuple(env.resolve_block_id(s) for s in val.shape)
-            # only tiles that span at least one block axis are register-resident reduction tiles
-            if any(d is not None for d in dims):
-                shape_of[node] = dims
-
-    # Graph-wide max rank -> a FIXED-length, absolute-rank-indexed profile so the lexicographic
-    # comparison aligns the same rank across steps (a per-step-length key would compare a step's
-    # rank-2 count against another's rank-1 count and mis-rank the scalar swarm as the winner).
-    max_rank = max((_tile_rank(d) for d in shape_of.values()), default=0)
-
-    best_key: tuple[int, ...] = ()
-    best_tiles: list[tuple[int | None, ...]] = []
-    live: set[torch.fx.Node] = set()
-    for i, node in enumerate(nodes):
-        if node in shape_of:
-            live.add(node)
-        cur = [shape_of[v] for v in live]
-        key = _tile_set_rank_profile(cur, max_rank)
-        if key > best_key:
-            best_key = key
-            best_tiles = cur
-        live = {v for v in live if last_use.get(v, -1) > i}
-    return best_tiles
-
-
 def _collect_memory_op_facts(
-    device_ir: DeviceIR,
-) -> tuple[list[MemoryOpFact], dict[int, int]]:
+    analysis: DeviceIRAnalysis,
+) -> list[MemoryOpFact]:
     """Walk every device graph once and record per-load/store metadata.
 
     Produces one ``MemoryOpFact`` per load/store in the order used to size
@@ -3342,17 +3464,17 @@ def _collect_memory_op_facts(
     reduction-fact builders need no bespoke walk. ``reductions_fed`` runs
     ``_classify_load_dataflow`` once over ALL reduction axes, grouped by axis.
 
-    Returns ``(memory_op_facts, liveness_by_axis)`` -- the second is the per-axis
-    peak simultaneously-live rdim-shaped tile count (max over graphs), computed in
-    this SAME pass so the kernel-fact builder can read a per-axis slice.
+    Node lists, dot recognition, and reduction attribution come from the shared
+    :class:`DeviceIRAnalysis`; this pass adds the memory-op-specific dataflow.
     """
     from ..autotuner.config_spec import MemoryOpFact
     from ..language import memory_ops
-    from .inductor_lowering import ReductionLowering
+    from .device_ir_analysis import matmul_operand_positions
+    from .device_ir_analysis import trace_back_to_load
 
     load_op = memory_ops.load
     store_op = memory_ops.store
-    operand_positions = _matmul_operand_positions()
+    operand_positions = matmul_operand_positions()
 
     env = CompileEnvironment.current()
     host = HostFunction.current()
@@ -3362,25 +3484,13 @@ def _collect_memory_op_facts(
     records: list[tuple[torch.fx.Node, MemoryOpFact]] = []
     memory_op_index = 0
     eviction_index = 0
-    liveness_by_axis: dict[int, int] = {}
 
-    for graph_info in device_ir.graphs:
-        graph = graph_info.graph
-        # Reduction-body liveness (per-axis peak live tiles), merged max over graphs — part of
-        # this single collect pass, not a second traversal.
-        for axis, peak in _graph_peak_live_by_axis(graph, env).items():
-            if peak > liveness_by_axis.get(axis, 0):
-                liveness_by_axis[axis] = peak
+    for graph_analysis in analysis.graphs:
         # Axis (block_index) of every ReductionLowering node in this graph — the cut set
         # for the dataflow classification, so a fed reduction maps to its axis.
-        red_axis_by_id: dict[int, int] = {
-            id(node): node.meta["lowering"].block_index
-            for node in graph.nodes
-            if isinstance(node.meta.get("lowering"), ReductionLowering)
-            and isinstance(getattr(node.meta["lowering"], "block_index", None), int)
-        }
+        red_axis_by_id = graph_analysis.reduction_axis_by_node_id
         redset = set(red_axis_by_id)
-        for node in graph.nodes:
+        for node in graph_analysis.nodes:
             if node.op != "call_function":
                 continue
 
@@ -3391,7 +3501,7 @@ def _collect_memory_op_facts(
                     (positions[1], "rhs"),
                 ):
                     if arg_index < len(node.args):
-                        load = _trace_back_to_load(node.args[arg_index], load_op)
+                        load = trace_back_to_load(node.args[arg_index], load_op)
                         if load is not None:
                             operands.setdefault(load, operand)
                 continue
@@ -3499,7 +3609,7 @@ def _collect_memory_op_facts(
                         ndim=fake.ndim if fake is not None else 0,
                         num_reuses=len(node.users) if is_load else 0,
                         matmul_operand=None,
-                        graph_id=graph_info.graph_id,
+                        graph_id=graph_analysis.graph_id,
                         reductions_fed=reductions_fed,
                         stores_fed=stores_fed,
                         indexed_block_ids=indexed_block_ids,
@@ -3515,8 +3625,7 @@ def _collect_memory_op_facts(
             )
             memory_op_index += 1
 
-    facts = [fact._replace(matmul_operand=operands.get(node)) for node, fact in records]
-    return facts, liveness_by_axis
+    return [fact._replace(matmul_operand=operands.get(node)) for node, fact in records]
 
 
 def _indexing_uses_tensor_descriptor(
@@ -3921,9 +4030,16 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         )
                 config_spec.allowed_pid_types = non_persistent_pid_types
 
-        # Collect per-load/store metadata once so heuristics can map each Config.indexing slot to its
-        # graph op; the same pass returns the reduction-body liveness (per-axis peak live tiles).
-        memory_op_facts, liveness_by_axis = _collect_memory_op_facts(device_ir)
+        # Build structural and liveness observations once, after reduction rolling has
+        # finalized the graph set. Specialized fact passes consume this shared analysis.
+        from .device_ir_analysis import DeviceIRAnalysis
+
+        analysis = DeviceIRAnalysis.build(device_ir, CompileEnvironment.current())
+        config_spec.kernel_grid_fact = analysis.kernel_grid_fact
+
+        # Collect per-load/store metadata so heuristics can map each Config.indexing
+        # slot to its graph op.
+        memory_op_facts = _collect_memory_op_facts(analysis)
         config_spec.memory_op_facts = memory_op_facts
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
@@ -3947,10 +4063,15 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.accumulator_facts = device_ir.build_accumulator_facts()
         # Phase 3 (PROMPT §2.1/§2.2): build the categorizing ReductionKernelFact — the first-class
         # reduction-descriptor list + co-residency groups the reduction seed + allocator consume.
-        # liveness_by_axis supplies each descriptor's per-axis liveness slice.
         device_ir.build_reduction_kernel_fact(
-            memory_op_facts, config_spec.accumulator_facts, liveness_by_axis
+            memory_op_facts,
+            config_spec.accumulator_facts,
+            analysis,
         )
+        # Phase 3b: compose the whole-kernel contraction fact for ANY kernel with a matmul,
+        # so both matmul front ends read one description of the workload (axis roles, knob
+        # competition, per-dot placement/work, peak liveness).
+        device_ir.build_kernel_matmul_fact(analysis)
         # Phase 4: compose a matmul + reduction-over-output epilogue fact when a matmul AND a
         # register-resident epilogue reduction co-occur (matmul_rms_norm etc.).
         device_ir.build_matmul_reduction_epilogue_facts()
