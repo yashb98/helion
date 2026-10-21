@@ -375,6 +375,7 @@ def run_evaluate_phase(config: RunConfig) -> bool:
     # First evaluate against measurement data
     eval_results: dict[str, dict[str, float]] = {}
     evaluations: list[tuple[Path, dict[str, dict[str, float]]]] = []
+    all_passed = True
     partitions = measurement_files(config.run_dir, config.hardware_id) or [
         config.run_dir / f"measurements_{config.hardware_id}.csv"
     ]
@@ -385,6 +386,9 @@ def run_evaluate_phase(config: RunConfig) -> bool:
             measurements_file=measurements_file,
             heuristic_dir=config.run_dir,
         )
+        if not data or set(results) != set(data):
+            log.warning("Evaluation did not cover every measured kernel")
+            all_passed = False
         eval_file = policy_path(
             config.run_dir / f"evaluation_{config.hardware_id}.json", policy
         )
@@ -394,7 +398,6 @@ def run_evaluate_phase(config: RunConfig) -> bool:
         )
 
     # Check if performance goals are met
-    all_passed = True
     for kernel_name, stats in eval_results.items():
         if config.goal_type == "max_slowdown":
             passed = stats["max_slowdown"] <= config.threshold
@@ -402,6 +405,7 @@ def run_evaluate_phase(config: RunConfig) -> bool:
             passed = stats["geomean_slowdown"] <= config.threshold
         else:
             passed = stats["avg_slowdown"] <= config.threshold
+        passed = passed and stats["coverage"] == 1.0
 
         status = "PASS" if passed else "FAIL"
         log.info(
@@ -428,6 +432,7 @@ def run_evaluate_phase(config: RunConfig) -> bool:
 
         if return_code != 0:
             log.warning(f"Evaluate benchmark failed with return code {return_code}")
+            all_passed = False
 
     for eval_file, results in evaluations:
         eval_file.write_text(json.dumps(results, indent=2))

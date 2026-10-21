@@ -36,6 +36,7 @@ from typing import Any
 from typing import Literal
 
 import numpy as np
+import torch
 
 from ..runtime.config import Config
 from ..runtime.cute_structural_config import CuteStructuralConfig
@@ -1168,6 +1169,40 @@ def _combine_heuristics(
 # ============================================================================
 
 
+def _evaluation_args(features: dict[str, Any]) -> tuple[object, ...]:
+    """Reconstruct only the argument metadata read by generated selectors.
+
+    User keys are already flattened. Shape selectors only inspect tensor
+    shapes and dtypes, so meta tensors avoid allocating the measured inputs.
+    """
+    key_indices = [int(name[4:]) for name in features if name.startswith("key_")]
+    if key_indices:
+        return tuple(features[f"key_{i}"] for i in range(max(key_indices) + 1))
+
+    arg_indices = [
+        int(match.group(1))
+        for name in features
+        if (match := re.fullmatch(r"arg(\d+)_.+", name))
+    ]
+    args: list[object] = []
+    for i in range(max(arg_indices, default=-1) + 1):
+        prefix = f"arg{i}_"
+        if prefix + "scalar" in features:
+            args.append(features[prefix + "scalar"])
+        elif prefix + "ndim" in features:
+            shape = tuple(
+                # Batched dimensions are intentionally absent from the features.
+                features.get(prefix + f"dim{j}", 1)
+                for j in range(features[prefix + "ndim"])
+            )
+            dtype_name = features.get(prefix + "dtype", "torch.float32")
+            dtype = getattr(torch, dtype_name.removeprefix("torch."))
+            args.append(torch.empty(shape, dtype=dtype, device="meta"))
+        else:
+            args.append(None)
+    return tuple(args)
+
+
 def evaluate_heuristic(
     measurements_file: Path,
     heuristic_dir: Path,
@@ -1202,8 +1237,7 @@ def evaluate_heuristic(
         model_configs(module, kname, data.cute_structural_policy)
 
         select_fn = getattr(module, f"select_config_{kname}", None)
-        if select_fn is None:
-            continue
+        autotune_fn = getattr(module, f"autotune_{kname}", None)
 
         # Evaluate on all shapes
         best_per_shape = np.min(data.timings, axis=1)
@@ -1211,7 +1245,12 @@ def evaluate_heuristic(
 
         for i, features in enumerate(data.shape_features):
             try:
-                selected_config = select_fn(features)
+                if select_fn is not None:
+                    selected_config = select_fn(features)
+                elif autotune_fn is not None:
+                    selected_config = autotune_fn(*_evaluation_args(features))
+                else:
+                    raise ValueError(f"No heuristic selector for {kname}")
                 if isinstance(selected_config, CuteStructuralConfig):
                     require_same_structural_policy(
                         selected_config.policy,
